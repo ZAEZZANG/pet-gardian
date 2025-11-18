@@ -1,135 +1,107 @@
-/*
- * 위성 PIR(사람 입장 감지) → 허브(일체형) HTTP POST 알림
- * - 보드: Seeed XIAO ESP32-C3 (Arduino Core for ESP32)
- * - 동작: PIR이 HIGH로 안정되면 "사람이 출입하였습니다"를 허브에 전송
- * - 채터링 방지: 안정화 시간 + 쿨다운
- */
-
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h>
 
-// ====== [사용자 설정] ======
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+/* -------------------------------
+   🔵 1. Wi-Fi 설정
+-------------------------------- */
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";       // ← 수정
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";   // ← 수정
 
-// 허브(일체형)의 HTTP 엔드포인트 (FastAPI 예시: POST /events/entry)
-String HUB_BASE_URL = "http://192.168.0.50:8000";
-String HUB_ENDPOINT = "/events/entry";
+/* -------------------------------
+   🔵 2. MQTT 설정
+-------------------------------- */
+const char* MQTT_SERVER   = "RASPBERRY_PI_IP";  // ← 예: "192.168.0.15"
+const int   MQTT_PORT     = 1883;
+const char* MQTT_CLIENT_ID = "satellite_pir_1";
+const char* MQTT_TOPIC     = "room1/person";
 
-// 노드/위치 식별자
-String NODE_ID = "satellite_pir_door1";
-String ROOM_ID = "entrance";
+/* -------------------------------
+   🔵 3. PIR 설정
+-------------------------------- */
+const int PIR_PIN = D2;   // XIAO ESP32-C3의 핀 설정 (GPIO 2)
+int lastPirState = LOW;
 
-// PIR 핀 (XIAO ESP32-C3에서 D2로 가정. 다른 핀 쓰면 바꾸세요)
-const int PIR_PIN = D2;  // 또는 숫자 GPIO로 사용 가능 (예: 6, 7 등)
+unsigned long lastTriggerTime = 0;
+const unsigned long DEBOUNCE_INTERVAL = 3000; // 3초 동안 추가 감지 무시
 
-// 감지 판정 파라미터
-const unsigned long STABLE_HIGH_MS  = 120;   // HIGH 유지되어야 하는 최소 시간(채터링 방지)
-const unsigned long COOLDOWN_MS     = 8000;  // 한 번 전송 후 다음 전송까지 최소 간격
-// =========================
+WiFiClient espClient;
+PubSubClient client(espClient);
 
-unsigned long lastHighStart = 0;
-bool          wasHigh       = false;
-unsigned long lastSentMs    = 0;
-
+/* -------------------------------
+   WiFi 연결 함수
+-------------------------------- */
 void connectWiFi() {
-  WiFi.mode(WIFI_STA);
+  Serial.print("WiFi 연결 중...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("[WiFi] Connecting");
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
     Serial.print(".");
-    delay(300);
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\n[WiFi] Failed to connect (will retry in loop)");
-  }
+  Serial.println("\nWiFi 연결 성공!");
 }
 
-bool postEntryEvent(const String& message) {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[HTTP] WiFi not connected. Skip send.");
-      return false;
+/* -------------------------------
+   MQTT 재연결 함수
+-------------------------------- */
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("MQTT 연결 중...");
+    if (client.connect(MQTT_CLIENT_ID)) {
+      Serial.println("성공!");
+      client.subscribe(MQTT_TOPIC);
+    } else {
+      Serial.print("실패. 코드=");
+      Serial.print(client.state());
+      Serial.println(" 재시도...");
+      delay(1000);
     }
   }
-
-  HTTPClient http;
-  String url = HUB_BASE_URL + HUB_ENDPOINT;
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json; charset=utf-8");
-
-  // 예시 JSON 페이로드 (FastAPI에서 request.body로 받기 쉬운 형태)
-  // 필요한 필드는 허브 규격에 맞춰 자유롭게 추가하세요.
-  String payload = String("{")
-    + "\"node_id\":\"" + NODE_ID + "\","
-    + "\"room_id\":\"" + ROOM_ID + "\","
-    + "\"event\":\"entry\","
-    + "\"message\":\"사람이 출입하였습니다\","
-    + "\"ts\":" + String((unsigned long)time(nullptr)) +
-  "}";
-
-  Serial.println("[HTTP] POST " + url);
-  Serial.println("[HTTP] Payload: " + payload);
-
-  int code = http.POST(payload);
-  if (code > 0) {
-    Serial.printf("[HTTP] Response code: %d\n", code);
-    String resp = http.getString();
-    Serial.println("[HTTP] Body: " + resp);
-  } else {
-    Serial.printf("[HTTP] POST failed, error: %s\n", http.errorToString(code).c_str());
-  }
-
-  http.end();
-  return (code >= 200 && code < 300);
 }
 
+/* -------------------------------
+   MQTT 발행 함수
+-------------------------------- */
+void sendDoorCrossEvent() {
+  client.publish(MQTT_TOPIC, "door_cross");
+  Serial.println("[전송] door_cross");
+}
+
+/* -------------------------------
+   Setup
+-------------------------------- */
 void setup() {
   Serial.begin(115200);
-  delay(400);
+  pinMode(PIR_PIN, INPUT);
 
-  pinMode(PIR_PIN, INPUT); // HC-SR501은 자체 드라이브 출력 → 내부 풀업/다운 불필요
   connectWiFi();
 
-  Serial.println("\n=== Satellite PIR (Human Entry) ===");
-  Serial.println("PIR_PIN: D2 (change if needed)");
-  Serial.println("Cooldown: " + String(COOLDOWN_MS) + " ms, StableHigh: " + String(STABLE_HIGH_MS) + " ms");
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+
+  Serial.println("위성 PIR 준비 완료");
 }
 
+/* -------------------------------
+   Loop — PIR 감지 + MQTT 전송
+-------------------------------- */
 void loop() {
-  int pir = digitalRead(PIR_PIN);
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+  client.loop();
+
+  int pirState = digitalRead(PIR_PIN);
   unsigned long now = millis();
 
-  if (pir == HIGH) {
-    if (!wasHigh) {
-      // 막 HIGH로 올라온 시점 기록
-      lastHighStart = now;
-      wasHigh = true;
-    } else {
-      // HIGH가 일정 시간 이상 유지되면 '감지'로 판정
-      if (now - lastHighStart >= STABLE_HIGH_MS) {
-        // 쿨다운 체크
-        if (now - lastSentMs >= COOLDOWN_MS) {
-          Serial.println("▶ 사람 감지됨 → '사람이 출입하였습니다' 전송");
-
-          bool ok = postEntryEvent("사람이 출입하였습니다");
-          if (ok) {
-            Serial.println("✅ 허브에 전송 성공");
-          } else {
-            Serial.println("❌ 전송 실패 (WiFi/HTTP 문제)");
-          }
-          lastSentMs = now;
-        }
-      }
+  // 🔥 LOW → HIGH (사람 문 통과 순간)
+  if (pirState == HIGH && lastPirState == LOW) {
+    if (now - lastTriggerTime > DEBOUNCE_INTERVAL) {
+      sendDoorCrossEvent();
+      lastTriggerTime = now;
     }
-  } else {
-    // LOW 상태로 내려옴 → 상태 리셋
-    wasHigh = false;
   }
 
-  delay(10); // 루프 템포
+  lastPirState = pirState;
+  delay(50);
 }
+
