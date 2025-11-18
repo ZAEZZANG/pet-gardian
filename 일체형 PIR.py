@@ -1,259 +1,138 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-일체형 PIR: 반려동물 감지시에만 mmWave + 열화상 센서를 '깨우는' 전력 절약 컨트롤러
-- PIR HIGH(감지) → 센서 ON(전원/EN) → 웜업 → 데이터 수집 시작
-- PIR 무감지 일정 시간 지속 → 센서 OFF
-- 라즈베리파이 4/5 + HC-SR501 + MLX90640 + MR60BHA1 가정
-"""
-
+import RPi.GPIO as GPIO
 import time
-import threading
-import signal
-from datetime import datetime
-from gpiozero import MotionSensor, OutputDevice
 
-# ===== 사용자 설정 =====
-PIR_PIN_BCM        = 17     # PIR OUT (HC-SR501)
-MMW_PWR_PIN_BCM    = 22     # mmWave 전원/EN GPIO (없으면 None)
-THERM_PWR_PIN_BCM  = 27     # 열화상 전원/EN GPIO (없으면 None)
-ACTIVE_HIGH_POWER  = True   # True: HIGH=ON, False: LOW=ON
+# ============================================
+# 🔵 1. 핀 번호 & 상태 변수 설정
+# ============================================
 
-INACTIVITY_SEC     = 30     # 이 시간 동안 PIR이 조용하면 센서 OFF
-RETRIGGER_GAP_SEC  = 1.0    # 연속 트리거 과민 방지
-WARMUP_MMW_SEC     = 0.5    # mmWave 웜업
-WARMUP_THERM_SEC   = 1.5    # MLX90640 웜업
+# PIR 센서가 연결된 라즈베리파이 GPIO 번호 (BCM 기준)
+# 예: GPIO17 에 연결했다면 17, 실제 연결한 핀 번호로 바꿔줘야 함!
+PIR_PIN = 17   
 
-# (선택) 센서 사용: 라이브러리가 없으면 자동 더미 모드로 동작
-USE_THERMAL        = True
-USE_MMWAVE         = True
-# ======================
+# mmWave / 열화상 센서의 "전원 상태"를 기억하는 변수
+mmwave_on = False      # 현재 mmWave가 켜져 있는지 여부
+thermal_on = False     # 현재 열화상 카메라가 켜져 있는지 여부
 
-# MLX90640 준비(옵션)
-MLX_OK = False
-if USE_THERMAL:
-    try:
-        import board, busio, adafruit_mlx90640
-        MLX_OK = True
-    except Exception:
-        MLX_OK = False
-
-# UART 준비(옵션)
-UART_OK = False
-if USE_MMWAVE:
-    try:
-        import serial
-        UART_OK = True
-    except Exception:
-        UART_OK = False
+# PIR이 움직임을 감지하면, 그 시점부터 최소 얼마 동안 센서를 켜둘지
+sensor_active_until = 0           # 이 시각까지는 센서를 켜두자 (유닉스 타임스탬프)
+SENSOR_ACTIVE_TIME = 60           # 움직임 감지 후 60초 동안은 ON 유지 (초 단위)
 
 
-class PowerSwitch:
-    """GPIO로 전원/EN 신호를 제어하는 래퍼"""
-    def __init__(self, pin_bcm, active_high=True):
-        self.dev = None
-        if pin_bcm is not None:
-            self.dev = OutputDevice(pin_bcm, active_high=active_high, initial_value=False)
+# ============================================
+# 🔵 2. 센서 전원 ON/OFF 함수
+#     - 지금은 print만 찍고,
+#       나중에 실제 전원 제어 핀 / 초기화 코드 넣으면 됨
+# ============================================
 
-    def on(self):
-        if self.dev: self.dev.on()
+def mmwave_power_on():
+    """
+    mmWave 센서를 켜는 함수.
+    - 실제로는 전원 인가, 초기화 코드 등이 들어갈 자리.
+    """
+    global mmwave_on
+    if not mmwave_on:
+        print("[일체형 PIR] mmWave ON")
+        # TODO: 👉 여기서 실제 mmWave 전원 ON / 초기화 코드 넣기
+        # 예시:
+        # GPIO.output(MMWAVE_EN_PIN, GPIO.HIGH)
+        mmwave_on = True
 
-    def off(self):
-        if self.dev: self.dev.off()
+def mmwave_power_off():
+    """
+    mmWave 센서를 끄는 함수.
+    - 저전력 모드, 전원 차단 등 구현 가능.
+    """
+    global mmwave_on
+    if mmwave_on:
+        print("[일체형 PIR] mmWave OFF")
+        # TODO: 👉 여기서 실제 mmWave 전원 OFF 코드 넣기
+        # 예시:
+        # GPIO.output(MMWAVE_EN_PIN, GPIO.LOW)
+        mmwave_on = False
 
+def thermal_power_on():
+    """
+    열화상 카메라를 켜는 함수.
+    - I2C 초기화, 라이브러리 인스턴스 생성 등을 여기서 해도 됨.
+    """
+    global thermal_on
+    if not thermal_on:
+        print("[일체형 PIR] Thermal ON")
+        # TODO: 👉 여기서 실제 열화상 카메라 ON / 초기화 코드 넣기
+        thermal_on = True
 
-class ThermalTask:
-    """MLX90640 열화상 간단 수집 루프(더미 지원)"""
-    def __init__(self):
-        self._stop = threading.Event()
-        self._th = None
-        self._ready = False
-        self.mlx = None
+def thermal_power_off():
+    """
+    열화상 카메라를 끄는 함수.
+    - 필요하다면 전원 차단, 리소스 정리 등 수행.
+    """
+    global thermal_on
+    if thermal_on:
+        print("[일체형 PIR] Thermal OFF")
+        # TODO: 👉 여기서 실제 열화상 카메라 OFF 코드 넣기
+        thermal_on = False
 
-    def start(self):
-        if MLX_OK:
-            try:
-                i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
-                self.mlx = adafruit_mlx90640.MLX90640(i2c)
-                self.mlx.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_4_HZ
-                self._ready = True
-                print("[THERM] MLX90640 초기화 완료")
-            except Exception as e:
-                self._ready = False
-                print(f"[THERM] 초기화 실패: {e}")
-        else:
-            print("[THERM] 라이브러리 없음 → 더미 모드")
+def wake_sensors():
+    """
+    ✅ 일체형 PIR이 '무언가 움직임'을 감지했을 때 호출되는 함수.
+       강아지든 사람이든 상관없이:
+       - mmWave 센서 ON
+       - 열화상 카메라 ON
+       - 그리고 SENSOR_ACTIVE_TIME 동안은 최소한 켜두도록 시간 갱신
+    """
+    global sensor_active_until
+    now = time.time()
+    sensor_active_until = now + SENSOR_ACTIVE_TIME  # 지금 시각 + 60초
 
-        self._stop.clear()
-        self._th = threading.Thread(target=self._loop, daemon=True)
-        self._th.start()
-
-    def _loop(self):
-        frame = [0]*768  # 32x24
-        last_print = 0
-        while not self._stop.is_set():
-            if self._ready and self.mlx:
-                try:
-                    self.mlx.getFrame(frame)
-                    now = time.time()
-                    if now - last_print >= 1.0:
-                        tmin, tmax = min(frame), max(frame)
-                        tcenter = frame[12*32 + 16]
-                        print(f"[THERM] Tmin={tmin:.1f}°C, Tcenter={tcenter:.1f}°C, Tmax={tmax:.1f}°C")
-                        last_print = now
-                except Exception as e:
-                    print(f"[THERM] 읽기 실패: {e}")
-                    time.sleep(0.1)
-            else:
-                time.sleep(0.25)
-
-    def stop(self):
-        self._stop.set()
-        if self._th: self._th.join(timeout=2)
-        self._ready = False
-        self.mlx = None
-        print("[THERM] 정지")
-
-
-class MmWaveTask:
-    """mmWave(MR60BHA1 등) UART 수신 루프(더미 지원)"""
-    def __init__(self, port="/dev/serial0", baud=115200):
-        self.port = port
-        self.baud = baud
-        self._stop = threading.Event()
-        self._th = None
-        self.ser = None
-        self._ready = False
-
-    def start(self):
-        if UART_OK:
-            try:
-                self.ser = serial.Serial(self.port, self.baud, timeout=0.2)
-                self._ready = True
-                print("[MMW] UART 연결 완료")
-            except Exception as e:
-                self._ready = False
-                print(f"[MMW] UART 실패: {e}")
-        else:
-            print("[MMW] pyserial 없음 → 더미 모드")
-
-        self._stop.clear()
-        self._th = threading.Thread(target=self._loop, daemon=True)
-        self._th.start()
-
-    def _loop(self):
-        while not self._stop.is_set():
-            if self._ready and self.ser:
-                try:
-                    data = self.ser.read(128)
-                    if data:
-                        # TODO: 프로토콜 파싱/호흡수 추정 연결
-                        print(f"[MMW] {len(data)} bytes 수신")
-                except Exception as e:
-                    print(f"[MMW] 수신오류: {e}")
-                    time.sleep(0.1)
-            else:
-                time.sleep(0.25)
-
-    def stop(self):
-        self._stop.set()
-        if self._th: self._th.join(timeout=2)
-        if self.ser:
-            try: self.ser.close()
-            except: pass
-        self.ser = None
-        self._ready = False
-        print("[MMW] 정지")
+    mmwave_power_on()
+    thermal_power_on()
 
 
-class PetTriggerController:
-    """PIR로 반려동물 감지 시 센서 ON/OFF를 관리"""
-    def __init__(self):
-        # PIR (HC-SR501: active-high)
-        self.pir = MotionSensor(PIR_PIN_BCM, queue_len=1, sample_rate=50, threshold=0.5)
-        self.pir.when_motion = self._on_motion
+# ============================================
+# 🔵 3. PIR 콜백 & GPIO 초기 설정
+# ============================================
 
-        # 전원/EN
-        self.mmw_pw   = PowerSwitch(MMW_PWR_PIN_BCM,   ACTIVE_HIGH_POWER)
-        self.therm_pw = PowerSwitch(THERM_PWR_PIN_BCM, ACTIVE_HIGH_POWER)
+def pir_callback(channel):
+    """
+    🟡 일체형 PIR이 '움직임 감지'했을 때 자동으로 호출되는 함수.
+       - 이 코드는 위치 상관 없음 (옆 벽 중앙, 허브 앞…)
+       - '시야 안에서 무언가 움직임 감지됨' → 센서 깨우기
+    """
+    print("[일체형 PIR] 움직임 감지 → mmWave + Thermal 깨우기")
+    wake_sensors()
 
-        # 센서 작업
-        self.mmw   = MmWaveTask()
-        self.therm = ThermalTask()
+def setup_pir():
+    """
+    프로그램 시작 시, 딱 한 번만 호출해서
+    - GPIO 모드 설정
+    - PIR 핀 입력으로 설정
+    - RISING 엣지(LOW→HIGH) 감지 시 pir_callback 호출하도록 등록
+    """
+    GPIO.setmode(GPIO.BCM)  # BCM 모드 사용 (핀 번호를 GPIO 번호로 씀)
+    GPIO.setup(PIR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 
-        # 상태
-        self.sensors_on = False
-        self.last_motion = datetime.min
-        self._lock = threading.Lock()
-
-    # PIR이 움직임(반려동물) 감지
-    def _on_motion(self):
-        now = datetime.now()
-        with self._lock:
-            if (now - self.last_motion).total_seconds() < RETRIGGER_GAP_SEC:
-                return  # 과민 방지
-            self.last_motion = now
-
-            if not self.sensors_on:
-                print("[SYS] 반려동물 감지 → 센서 ON")
-                self._power_on_and_start()
-
-    def _power_on_and_start(self):
-        # 전원/EN ON
-        self.mmw_pw.on()
-        self.therm_pw.on()
-
-        # 웜업 후 시작 순서
-        time.sleep(WARMUP_MMW_SEC)
-        if USE_MMWAVE: self.mmw.start()
-        remain = max(WARMUP_THERM_SEC - WARMUP_MMW_SEC, 0)
-        time.sleep(remain)
-        if USE_THERMAL: self.therm.start()
-
-        self.sensors_on = True
-
-    def _power_off_and_stop(self):
-        # 작업 중지 → 전원 OFF
-        if USE_THERMAL: self.therm.stop()
-        if USE_MMWAVE:  self.mmw.stop()
-
-        self.therm_pw.off()
-        self.mmw_pw.off()
-
-        self.sensors_on = False
-        print("[SYS] 무감지 타임아웃 → 센서 OFF")
-
-    def run(self):
-        print("=== Pet Trigger Controller (PIR→mmWave+Thermal) ===")
-        print(f"PIR={PIR_PIN_BCM}, MMW_PWR={MMW_PWR_PIN_BCM}, THERM_PWR={THERM_PWR_PIN_BCM}, ACTIVE_HIGH={ACTIVE_HIGH_POWER}")
-        print("대기 중… (반려동물 감지 시 자동으로 켜짐)")
-
-        try:
-            while True:
-                time.sleep(0.2)
-                if self.sensors_on:
-                    idle = (datetime.now() - self.last_motion).total_seconds()
-                    if idle >= INACTIVITY_SEC:
-                        with self._lock:
-                            idle2 = (datetime.now() - self.last_motion).total_seconds()
-                            if self.sensors_on and idle2 >= INACTIVITY_SEC:
-                                self._power_off_and_stop()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            if self.sensors_on:
-                self._power_off_and_stop()
+    # RISING: LOW -> HIGH로 바뀌는 순간만 감지
+    # bouncetime=200: 200ms 안에 튀는 신호는 무시 (디바운스)
+    GPIO.add_event_detect(PIR_PIN, GPIO.RISING,
+                          callback=pir_callback, bouncetime=200)
+    print("[일체형 PIR] 설정 완료 (옆 벽 중앙에서 움직임 감지 대기 중)")
 
 
-def main():
-    ctrl = PetTriggerController()
+# ============================================
+# 🔵 4. 센서 전원 유지 / OFF 관리
+# ============================================
 
-    def _sigterm(signum, frame):
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, _sigterm)
+def update_sensor_power():
+    """
+    메인 루프에서 주기적으로 호출해서,
+    - sensor_active_until 시간이 지났다면
+      mmWave와 열화상 센서를 OFF 시켜주는 함수.
 
-    ctrl.run()
-
-
-if __name__ == "__main__":
-    main()
+    👉 요약:
+       - 최근에 움직임 감지한 뒤 60초 동안은 ON 유지
+       - 그 이후로는 다시 OFF해서 전력 절약
+    """
+    now = time.time()
+    if now > sensor_active_until:
+        mmwave_power_off()
+        thermal_power_off()
