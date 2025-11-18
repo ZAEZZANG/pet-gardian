@@ -19,6 +19,15 @@
     · 최근 window_sec 동안의 평균값과 비교해 큰 오차가 나오면
         → [MMW][위기감지!] 메시지 출력
 
+- 추가 요구사항 반영:
+    · PIR은 항상 켜져 있음 (절대 OFF 안 함)
+    · 센서가 ON 된 뒤,
+        · 열화상: Tmax < THERM_THRESHOLD (30℃ 이하, hot pixel 없음)
+        · mmWave: 현재 값 <= 최근 평균값
+        · 두 센서 모두에서 [위기감지!]가 발생하지 않은 “안전 상태”가
+          INACTIVITY_SEC 동안 연속 유지되면
+          → mmWave + 열화상 OFF (PIR은 계속 대기)
+
 라즈베리파이 4/5 + Raspberry Pi OS + Python 3.xx 가정
 """
 
@@ -40,8 +49,8 @@ THERM_PWR_PIN_BCM  = 27     # 열화상 전원/EN GPIO (없으면 None)
 ACTIVE_HIGH_POWER  = True   # True: HIGH=ON, False: LOW=ON
 
 # --- 동작 타이밍 ---
-INACTIVITY_SEC     = 30     # 이 시간 동안 PIR이 조용하면 센서 OFF
-RETRIGGER_GAP_SEC  = 1.0    # 연속 트리거 과민 방지 최소 간격 [s]
+INACTIVITY_SEC     = 30     # 이 시간 동안 "안전 상태"가 유지되면 mmWave+열화상 OFF
+RETRIGGER_GAP_SEC  = 1.0    # PIR 연속 트리거 과민 방지 최소 간격 [s]
 WARMUP_MMW_SEC     = 0.5    # mmWave 웜업 [s]
 WARMUP_THERM_SEC   = 1.5    # MLX90640 웜업 [s]
 
@@ -105,13 +114,9 @@ class PirSensor:
     PIR(HC-SR501) 래퍼 클래스
     - MotionSensor 이벤트를 받아서 retrigger 간격을 적용하고
       유효한 트리거만 콜백으로 전달
+    - PIR 자체는 항상 켜져 있음 (전원 제어하지 않음)
     """
     def __init__(self, pin_bcm, retrigger_gap_sec, on_valid_motion):
-        """
-        :param pin_bcm: PIR OUT에 연결된 BCM 핀 번호
-        :param retrigger_gap_sec: 연속 트리거 최소 간격 [s]
-        :param on_valid_motion: 유효 트리거 발생 시 호출할 콜백 (함수)
-        """
         self._pin = pin_bcm
         self._gap = retrigger_gap_sec
         self._callback = on_valid_motion
@@ -128,10 +133,8 @@ class PirSensor:
         now = datetime.now()
         delta = (now - self._last_motion).total_seconds()
         if delta < self._gap:
-            # 너무 빠르게 연속으로 들어오는 트리거는 무시
             return
         self._last_motion = now
-        # 유효 트리거를 콜백으로 전달
         if self._callback:
             self._callback(now)
 
@@ -140,9 +143,11 @@ class PirSensor:
 class ThermalSensor:
     """
     MLX90640 열화상 수집 루프
-    - PIR이 켜주면 start()
     - 30℃ 이상 픽셀 개수 카운트
-    - 최근 window_sec 동안 Tmax가 danger_delta 이상 급격히 상승하면 "위기감지!"
+    - Tmax 급상승 시 위기감지
+    - last_data_time: 마지막 프레임 시각
+    - last_hot: 마지막 프레임에서 hot pixel(30℃ 이상)이 있었는지 여부
+    - danger_raised: 위기감지 발생 여부
     """
     def __init__(self,
                  threshold=THERM_THRESHOLD,
@@ -158,8 +163,11 @@ class ThermalSensor:
         self.window_sec = window_sec
         self._history = []  # (time, max_temp)
 
+        self.last_data_time = None
+        self.last_hot = False
+        self.danger_raised = False
+
     def start(self):
-        """센서 초기화 및 측정 루프 시작"""
         if MLX_OK:
             try:
                 i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
@@ -172,6 +180,10 @@ class ThermalSensor:
                 print(f"[THERM] 초기화 실패: {e}")
         else:
             print("[THERM] 라이브러리 없음 → 더미 모드")
+
+        self.danger_raised = False
+        self.last_hot = False
+        self.last_data_time = None
 
         self._stop.clear()
         self._th = threading.Thread(target=self._loop, daemon=True)
@@ -186,29 +198,29 @@ class ThermalSensor:
                 try:
                     self.mlx.getFrame(frame)
                     now = time.time()
+                    self.last_data_time = now
 
-                    # 1) 30℃ 이상 픽셀 개수 & 온도 통계
                     hot_pixels = [t for t in frame if t >= self.threshold]
                     hot_count = len(hot_pixels)
 
                     tmin = min(frame)
                     tmax = max(frame)
-                    # 가운데 픽셀 (12행, 16열)
                     tcenter = frame[12 * 32 + 16]
 
-                    # 2) Tmax 히스토리 갱신
+                    # hot 여부 업데이트 (30℃ 이상 픽셀 존재 여부)
+                    self.last_hot = (hot_count > 0)
+
                     self._history.append((now, tmax))
                     self._history = [(t, v) for (t, v) in self._history
                                      if now - t <= self.window_sec]
                     hist_vals = [v for (_, v) in self._history]
                     hist_min = min(hist_vals) if hist_vals else tmax
 
-                    # 3) 급격한 상승 감지
                     if tmax - hist_min >= self.danger_delta:
+                        self.danger_raised = True
                         print(f"[THERM][위기감지!] {self.window_sec:.0f}초 이내 "
                               f"Tmax가 {hist_min:.1f}→{tmax:.1f}°C로 급격히 상승")
 
-                    # 4) 1초에 한 번 상태 출력
                     if now - last_print >= 1.0:
                         print(
                             f"[THERM] hot≥{self.threshold:.1f}℃: {hot_count:3d}개 | "
@@ -223,13 +235,15 @@ class ThermalSensor:
                 time.sleep(0.25)
 
     def stop(self):
-        """측정 루프 정지 및 정리"""
         self._stop.set()
         if self._th:
             self._th.join(timeout=2)
         self._ready = False
         self.mlx = None
         self._history.clear()
+        self.last_data_time = None
+        self.last_hot = False
+        self.danger_raised = False
         print("[THERM] 정지")
 
 
@@ -237,9 +251,12 @@ class ThermalSensor:
 class MmWaveSensor:
     """
     mmWave(MR60BHA1 등) UART 수신 루프
-    - PIR이 켜주면 start()
-    - 센서에서 오는 데이터에서 "호흡/주파수" 값을 추출한다고 가정
-    - 최근 window_sec 동안의 평균과 비교해 큰 오차가 나면 "위기감지!"
+    - 호흡/주파수 값 추출 (더미 구현)
+    - 평균 대비 큰 오차는 위기감지
+    - last_data_time: 마지막 유효 값 시각
+    - last_val: 마지막 값
+    - last_avg: 최근 window 평균
+    - danger_raised: 위기감지 발생 여부
     """
 
     def __init__(self,
@@ -262,6 +279,11 @@ class MmWaveSensor:
         self.vmax = vmax
         self._history = []  # (time, value)
 
+        self.last_data_time = None
+        self.last_val = None
+        self.last_avg = None
+        self.danger_raised = False
+
     def start(self):
         if UART_OK:
             try:
@@ -274,25 +296,23 @@ class MmWaveSensor:
         else:
             print("[MMW] pyserial 없음 → 더미 모드")
 
+        self._history.clear()
+        self.last_data_time = None
+        self.last_val = None
+        self.last_avg = None
+        self.danger_raised = False
+
         self._stop.clear()
         self._th = threading.Thread(target=self._loop, daemon=True)
         self._th.start()
 
     def _parse_resp_value(self, data: bytes):
         """
-        mmWave 모듈에서 오는 raw bytes에서
-        '호흡/주파수' 값을 추출하는 함수.
-
-        ★ 현재는 예시용 더미 구현입니다. ★
-        실제 센서 프로토콜(데이터시트)을 보고
-        이 부분만 수정하면 됩니다.
-
-        여기서는 그냥:
-        - 데이터 길이를 이용해 가짜 값 생성 (디버깅용)
+        ★ 현재는 예시용 더미 구현 ★
+        실제 센서 프로토콜에 맞게 수정하면 된다.
         """
         if not data:
             return None
-        # 예시: 데이터 길이를 2로 나눈 값을 "호흡수"라고 가정 (더미)
         fake_val = len(data) / 2.0
         return fake_val
 
@@ -306,34 +326,32 @@ class MmWaveSensor:
                     if not data:
                         continue
 
-                    # 1) 원시 수신 로그 (필요시)
-                    # print(f"[MMW] {len(data)} bytes 수신")
-
-                    # 2) 호흡/주파수 값 추출
                     val = self._parse_resp_value(data)
                     if val is None:
                         continue
 
                     now = time.time()
 
-                    # 유효 범위 체크 (너무 이상한 값은 무시)
                     if not (self.vmin <= val <= self.vmax):
                         print(f"[MMW] 무시되는 값(범위 밖): {val:.1f}")
                         continue
 
-                    # 3) 히스토리 갱신
+                    self.last_data_time = now
+
                     self._history.append((now, val))
                     self._history = [(t, v) for (t, v) in self._history
                                      if now - t <= self.window_sec]
                     vals = [v for (_, v) in self._history]
                     avg = sum(vals) / len(vals) if vals else val
 
-                    # 4) 평균과의 큰 오차 감지
+                    self.last_val = val
+                    self.last_avg = avg
+
                     if abs(val - avg) >= self.danger_delta:
+                        self.danger_raised = True
                         print(f"[MMW][위기감지!] 최근 평균 {avg:.1f} 대비 "
                               f"{val:.1f}로 큰 오차 발생")
 
-                    # 5) 1초에 한 번 상태 출력
                     if now - last_print >= 1.0:
                         print(f"[MMW] 최근 {self.window_sec:.0f}s 평균={avg:.1f}, "
                               f"현재={val:.1f}")
@@ -357,6 +375,10 @@ class MmWaveSensor:
         self.ser = None
         self._ready = False
         self._history.clear()
+        self.last_data_time = None
+        self.last_val = None
+        self.last_avg = None
+        self.danger_raised = False
         print("[MMW] 정지")
 
 
@@ -364,50 +386,50 @@ class MmWaveSensor:
 class PetTriggerController:
     """
     PIR → mmWave + Thermal 센서 ON/OFF를 관리하는 상위 컨트롤러
-    - PIR은 PirSensor 클래스로 이벤트만 전달
-    - 센서 작동/정지는 이 컨트롤러가 관리
+
+    - PIR은 항상 켜져 있고, 움직임 감지 시 센서 ON
+    - 센서가 ON 된 후, 다음 조건이 모두 충족된 "안전 상태"가
+      INACTIVITY_SEC 동안 연속 유지되면 센서 OFF:
+        · Thermal: 마지막 Tmax < THERM_THRESHOLD (hot pixel 없음) 이고
+                   위기감지(danger_raised)도 발생 X
+        · mmWave: last_val <= last_avg 이고
+                  위기감지(danger_raised)도 발생 X
     """
     def __init__(self):
-        # PIR 래퍼 (유효 트리거 콜백 = self._on_valid_pir_motion)
         self.pir = PirSensor(
             pin_bcm=PIR_PIN_BCM,
             retrigger_gap_sec=RETRIGGER_GAP_SEC,
             on_valid_motion=self._on_valid_pir_motion
         )
 
-        # 전원/EN 제어용 GPIO
         self.mmw_pw   = PowerSwitch(MMW_PWR_PIN_BCM,   ACTIVE_HIGH_POWER)
         self.therm_pw = PowerSwitch(THERM_PWR_PIN_BCM, ACTIVE_HIGH_POWER)
 
-        # 센서 작업 객체
         self.mmw   = MmWaveSensor()
         self.therm = ThermalSensor()
 
-        # 상태 관리
         self.sensors_on = False
-        self.last_motion = datetime.min
         self._lock = threading.Lock()
 
-    # PIR에서 유효 움직임 감지 시 호출되는 콜백
+        # "안전 상태"가 시작된 시각 (None이면 아직 안전 연속 구간 아님)
+        self.safe_start_time = None
+
     def _on_valid_pir_motion(self, when: datetime):
         with self._lock:
-            self.last_motion = when
             if not self.sensors_on:
                 print("[SYS] 반려동물/대상 감지 → 센서 ON")
                 self._power_on_and_start()
 
     def _power_on_and_start(self):
-        """센서 전원 ON + 웜업 후 측정 시작"""
-        # 전원/EN ON
         self.mmw_pw.on()
         self.therm_pw.on()
 
-        # mmWave 먼저 웜업
+        self.safe_start_time = None
+
         time.sleep(WARMUP_MMW_SEC)
         if USE_MMWAVE:
             self.mmw.start()
 
-        # 남은 시간만큼 더 기다렸다가 열화상 시작
         remain = max(WARMUP_THERM_SEC - WARMUP_MMW_SEC, 0)
         time.sleep(remain)
         if USE_THERMAL:
@@ -416,7 +438,6 @@ class PetTriggerController:
         self.sensors_on = True
 
     def _power_off_and_stop(self):
-        """센서 측정 중지 + 전원 OFF"""
         if USE_THERMAL:
             self.therm.stop()
         if USE_MMWAVE:
@@ -426,24 +447,61 @@ class PetTriggerController:
         self.mmw_pw.off()
 
         self.sensors_on = False
-        print("[SYS] 무감지 타임아웃 → 센서 OFF")
+        self.safe_start_time = None
+        print("[SYS] 30초간 안전 상태 유지 → 센서 OFF (PIR은 계속 대기)")
+
+    def _check_safe_state(self, now: float) -> bool:
+        """
+        현재 시점에 열화상 + mmWave 모두 "안전한 상태"인지 판단.
+        True면 안전, False면 비안전(위험 또는 판단불가).
+        """
+        therm_safe = True
+        mmw_safe = True
+
+        if USE_THERMAL:
+            # 아직 데이터가 없거나 위기감지가 한 번이라도 떴으면 안전 X
+            if self.therm.last_data_time is None or self.therm.danger_raised:
+                therm_safe = False
+            else:
+                # hot pixel 없음 → Tmax < threshold
+                therm_safe = (self.therm.last_hot is False)
+
+        if USE_MMWAVE:
+            if (self.mmw.last_data_time is None or
+                self.mmw.danger_raised or
+                self.mmw.last_val is None or
+                self.mmw.last_avg is None):
+                mmw_safe = False
+            else:
+                # 현재값 <= 평균값일 때만 "안전"
+                mmw_safe = (self.mmw.last_val <= self.mmw.last_avg)
+
+        return therm_safe and mmw_safe
 
     def run(self):
         print("=== Pet Trigger Controller (PIR → mmWave + Thermal) ===")
         print(f"PIR={PIR_PIN_BCM}, MMW_PWR={MMW_PWR_PIN_BCM}, "
               f"THERM_PWR={THERM_PWR_PIN_BCM}, ACTIVE_HIGH={ACTIVE_HIGH_POWER}")
-        print("대기 중… (반려동물/대상 감지 시 자동으로 켜짐)")
+        print("대기 중… (PIR은 항상 켜져 있고, 감지 시 mmWave/열화상 ON)")
 
         try:
             while True:
                 time.sleep(0.2)
                 if self.sensors_on:
-                    idle = (datetime.now() - self.last_motion).total_seconds()
-                    if idle >= INACTIVITY_SEC:
-                        with self._lock:
-                            idle2 = (datetime.now() - self.last_motion).total_seconds()
-                            if self.sensors_on and idle2 >= INACTIVITY_SEC:
-                                self._power_off_and_stop()
+                    now = time.time()
+                    safe = self._check_safe_state(now)
+
+                    if safe:
+                        if self.safe_start_time is None:
+                            self.safe_start_time = now
+                        elif now - self.safe_start_time >= INACTIVITY_SEC:
+                            with self._lock:
+                                if self.sensors_on:
+                                    self._power_off_and_stop()
+                    else:
+                        # 한 번이라도 비안전 상태가 되면 타이머 리셋
+                        self.safe_start_time = None
+
         except KeyboardInterrupt:
             pass
         finally:
@@ -454,7 +512,6 @@ class PetTriggerController:
 def main():
     ctrl = PetTriggerController()
 
-    # systemd 등에서 SIGTERM 받을 때도 정상 종료하기 위해
     def _sigterm(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _sigterm)
