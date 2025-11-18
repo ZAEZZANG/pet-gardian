@@ -91,31 +91,51 @@ def update(frame):
     if breath is not None:
         breath_signal.append(breath)
 
-    # 데이터 길이 window 제한
     if len(motion_signal) > window_size:
         motion_signal.pop(0)
     if len(breath_signal) > window_size:
         breath_signal.pop(0)
 
-    # -------- 그래프 업데이트 --------
+    # 그래프 업데이트
     motion_line.set_data(range(len(motion_signal)), motion_signal)
     breath_line.set_data(range(len(breath_signal)), breath_signal)
 
     ax1.set_xlim(0, len(motion_signal))
     ax2.set_xlim(0, len(breath_signal))
 
-    # -------- BPM 계산 (움직임 낮을 때만) --------
+    # --------------------------------------------
+    # 🚑 BPM 측정 및 정상 범위 비교
+    # --------------------------------------------
     if len(breath_signal) > fs*5 and np.mean(motion_signal[-5:]) < 30:
         bpm = estimate_breathing_rate(breath_signal)
         if bpm:
             bpm_history.append(bpm)
-            ax2.set_title(f"🌬 호흡 신호 — BPM: {bpm:.1f}")
+
+            # ---- 기준값 설정 ----
+            SPECIES = "dog"   # <<<< 나중에 자동 인식/설정 변경 가능
+
+            if SPECIES == "dog":
+                normal_min, normal_max = 15, 30
+            else:  # cat
+                normal_min, normal_max = 20, 40
+
+            # ---- 상태 판정 ----
+            if bpm < normal_min:
+                status = "⚠️ 저호흡(저환기) 의심"
+            elif bpm > normal_max:
+                status = "🚨 빠른 호흡(빈호흡) 의심"
+            else:
+                status = "✅ 정상 호흡"
+
+            ax2.set_title(f"🌬 BPM: {bpm:.1f} — {status}")
+
         else:
-            ax2.set_title("🌬 호흡 신호 — 분석중...")
+            ax2.set_title("🌬 호흡 분석 중...")
     else:
-        ax2.set_title("🚨 움직임 감지 — 호흡 분석 잠시 중지")
+        ax2.set_title("🚨 움직임 감지 — 호흡 분석 중지")
 
     return motion_line, breath_line
+
 
 ani = FuncAnimation(fig, update, interval=100)  # 0.1초 주기
 plt.tight_layout()
