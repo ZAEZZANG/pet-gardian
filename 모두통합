@@ -30,7 +30,8 @@ import board, busio, adafruit_mlx90640
 
 # ====================== 사용자 설정 ======================
 
-MQTT_SERVER = "192.168.0.50"   # 라즈베리파이 IP
+MQTT_SERVER = "localhost"   # 라즈베리파이 IP
+MQTT_PORT = 1883   # 라즈베리파이 IP
 MQTT_TOPIC_PERSON = "room1/person"
 
 USE_TELEGRAM = True
