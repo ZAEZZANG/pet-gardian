@@ -1,3 +1,112 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+📌 Integrated Pet Monitoring System (PIR + mmWave + Thermal dummy)
+
+- PIR (HC-SR501)
+  · 항상 ON, 움직임 감지 → 시스템 깨움
+
+- mmWave (MR60BHA1)
+  · UART(/dev/serial0 @ 115200)에서 실데이터 파싱
+  · breath(bpm), motion(움직임 강도) 추출
+
+- Thermal (더미)
+  · 온도/핫픽셀 수를 랜덤으로 생성 (구조 테스트용)
+
+Logic:
+✔ PIR이 motion 감지 → 센서 전원 ON + mmWave 상태 초기화
+✔ 깨어 있는 동안:
+    - mmWave에서 bpm / motion 읽기
+    - Thermal에서 Temp / hot pixels 읽기(더미)
+    - 호흡 안정 + 움직임 거의 없음 → "수면 상태"로 간주, last_activity_time 갱신
+✔ last_activity_time 기준으로 NO_ACTIVITY_TIMEOUT 초 동안
+  motion/breathing 변동이 없으면 → 센서 전원 OFF (저전력)
+"""
+
+import time
+import threading
+import random
+from datetime import datetime
+
+import serial
+from gpiozero import MotionSensor, OutputDevice
+
+
+# ==========================
+# USER CONFIG
+# ==========================
+PIR_PIN = 17
+MMW_PWR_PIN = 22
+THERM_PWR_PIN = 27
+ACTIVE_HIGH = True
+
+WARMUP_MMW = 0.5
+WARMUP_THERM = 1.5
+
+NO_ACTIVITY_TIMEOUT = 120       # 2분 동안 motion + breathing 둘 다 변화 없으면 OFF
+BREATH_STILL_THRESHOLD = 5      # breathing 변화 없다고 판단 기준 (bpm 변화량)
+MIN_SLEEP_TIME = 20             # (추후 사용 가능) mmWave가 안정 신호 잡아야 sleep으로 인정
+
+
+# ==========================
+# State Variables
+# ==========================
+last_activity_time = time.time()
+system_awake = False
+
+breathing_history = []
+motion_level_history = []
+
+
+# ==========================
+# Hardware Power Control
+# ==========================
+class PowerControl:
+    def __init__(self, pin):
+        self.dev = OutputDevice(pin, active_high=ACTIVE_HIGH) if pin is not None else None
+
+    def on(self):
+        if self.dev:
+            self.dev.on()
+
+    def off(self):
+        if self.dev:
+            self.dev.off()
+
+
+mmw_power = PowerControl(MMW_PWR_PIN)
+thermal_power = PowerControl(THERM_PWR_PIN)
+
+
+# ==========================
+# mmWave UART 설정 + 파싱
+# ==========================
+MMW_PORT = "/dev/serial0"
+MMW_BAUD = 115200
+
+_mmw_ser = None
+_mmw_buf = b""
+_mmw_last_bpm = None       # 마지막 호흡 값
+_mmw_last_motion = 0.0     # 마지막 움직임 강도
+
+
+def init_mmwave_uart():
+    """mmWave용 UART 포트를 연다. (전역 1회)"""
+    global _mmw_ser
+    if _mmw_ser is None:
+        _mmw_ser = serial.Serial(MMW_PORT, MMW_BAUD, timeout=0.05)
+        print(f"[MMW] UART open on {MMW_PORT} @ {MMW_BAUD}")
+
+
+def reset_mmwave_state():
+    """센서 전원을 다시 켠 뒤, 내부 상태/버퍼 초기화."""
+    global _mmw_buf, _mmw_last_bpm, _mmw_last_motion
+    _mmw_buf = b""
+    _mmw_last_bpm = None
+    _mmw_last_motion = 0.0
+
+
 def _parse_one_frame(frame: bytes):
     """
     MR60BHA1 프로토콜 기준 단일 프레임 파싱
@@ -24,7 +133,7 @@ def _parse_one_frame(frame: bytes):
 
     data = frame[data_start:data_end]
     checksum = frame[data_end]
-    tail = frame[data_end + 1 : data_end + 3]
+    tail = frame[data_end + 1: data_end + 3]
 
     if tail != b"\x54\x43":   # 'T','C'
         return None
@@ -109,8 +218,8 @@ def get_mmwave_readings():
                     _mmw_buf = _mmw_buf[start:]
                 break
 
-            frame = _mmw_buf[start:start+frame_len]
-            _mmw_buf = _mmw_buf[start+frame_len:]  # 파싱한 프레임 제거
+            frame = _mmw_buf[start:start + frame_len]
+            _mmw_buf = _mmw_buf[start + frame_len:]  # 파싱한 프레임 제거
 
             parsed = _parse_one_frame(frame)
             if parsed:
@@ -129,3 +238,127 @@ def get_mmwave_readings():
         "bpm": bpm,
         "motion": motion,
     }
+
+
+# ==========================
+# Thermal readings (더미)
+# ==========================
+def get_thermal_readings():
+    """
+    Simulated thermal output.
+    실제 MLX90640로 교체 가능:
+    - Temp: Tmax 또는 중심 픽셀 온도
+    - pixels: THRESH 이상 hot pixel 개수
+    """
+    temp = random.uniform(30.0, 38.5)       # [°C]
+    pixels = random.randint(5, 80)          # hot pixel count
+    return temp, pixels
+
+
+# ==========================
+# System Behavior Logic
+# ==========================
+def wake_system():
+    global system_awake
+    if not system_awake:
+        print("🐶 Movement detected → Waking sensors...")
+        mmw_power.on()
+        thermal_power.on()
+        time.sleep(WARMUP_MMW)
+        reset_mmwave_state()   # mmWave 상태 초기화
+        time.sleep(WARMUP_THERM)
+        system_awake = True
+
+
+def sleep_system():
+    global system_awake
+    if system_awake:
+        print("😴 No movement for a while → Sensors entering low power mode...")
+        mmw_power.off()
+        thermal_power.off()
+        system_awake = False
+
+
+# ==========================
+# PIR Handler
+# ==========================
+pir = MotionSensor(PIR_PIN)
+
+
+def pir_triggered():
+    global last_activity_time
+    last_activity_time = time.time()
+    wake_system()
+
+
+pir.when_motion = pir_triggered
+
+
+# ==========================
+# MAIN MONITOR LOOP
+# ==========================
+def main_loop():
+    global last_activity_time
+
+    print("\n=== PET HEALTH MONITOR ACTIVE ===")
+    print("Waiting for motion...\n")
+
+    while True:
+        now = time.time()
+
+        if system_awake:
+            # 실제 mmWave + Thermal 읽기
+            mm_data = get_mmwave_readings()
+            temp, pixels = get_thermal_readings()
+
+            breathing_history.append(mm_data["bpm"])
+            motion_level_history.append(mm_data["motion"])
+
+            # 히스토리 길이 제한
+            if len(breathing_history) > 15:
+                breathing_history.pop(0)
+            if len(motion_level_history) > 15:
+                motion_level_history.pop(0)
+
+            # 안정 호흡 + 저움직임 → 수면 상태로 간주
+            if len(breathing_history) >= 1:
+                last_bpm = breathing_history[-1]
+                recent_breath = breathing_history[-10:]
+                recent_motion = motion_level_history[-5:]
+
+                stable_breathing = all(
+                    abs(last_bpm - x) < BREATH_STILL_THRESHOLD
+                    for x in recent_breath
+                )
+                low_motion = (len(recent_motion) > 0) and (max(recent_motion) < 2)
+
+                if low_motion and stable_breathing:
+                    # Animal sleeping, update last activity to prevent shutdown too early
+                    last_activity_time = now
+                    print("[STATUS] 💤 Stable breathing detected (sleep mode)")
+                else:
+                    print(
+                        f"[STATUS] Active | BPM={mm_data['bpm']:.1f} "
+                        f"Temp={temp:.1f}°C Pixels={pixels} Motion={mm_data['motion']:.1f}"
+                    )
+
+            # Check inactivity timeout
+            if now - last_activity_time > NO_ACTIVITY_TIMEOUT:
+                sleep_system()
+
+        else:
+            print("[STATUS] 📴 Idle — waiting for movement...")
+            time.sleep(1)
+
+        time.sleep(1)
+
+
+# ==========================
+# Run
+# ==========================
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        sleep_system()
+        print("\nProgram terminated.")
