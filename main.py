@@ -20,7 +20,7 @@ import time
 import numpy as np
 
 # --------- 센서 모듈 import ---------
-from sensors.mmWAVE import MmWave
+from sensors.mmwave import mmwave
 from sensors.열화상카메라 import (
     init_thermal,
     get_thermal_readings,
@@ -106,7 +106,7 @@ def main():
         print("[THERMAL] 초기화 실패. 열화상 없이 mmWave만 동작합니다.")
 
     # 3) mmWave 초기화
-    mm = MmWave(port="/dev/ttyAMA10", baud=115200, fs=FS_MMWAVE)
+    mm = mmwave(port="/dev/ttyAMA10", baud=115200, fs=FS_MMWAVE)
     print("[MMWAVE] 초기화 완료.")
 
     try:

@@ -5,7 +5,7 @@ import numpy as np
 from scipy.signal import detrend
 from scipy.fft import rfft, rfftfreq
 
-class MmWave:
+class mmwave:
     def __init__(self, port="/dev/ttyAMA10", baud=115200, fs=10):
         self.ser = serial.Serial(port, baud, timeout=0.5)
         self.fs = fs
