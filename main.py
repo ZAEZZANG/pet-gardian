@@ -20,8 +20,8 @@ import time
 import numpy as np
 
 # --------- 센서 모듈 import ---------
-from sensors.mmwave import mmwave
-from sensors.열화상카메라 import (
+from sensors.mmwave import Mmwave
+from sensors.thermal import (
     init_thermal,
     get_thermal_readings,
     classify_thermal_entity,
