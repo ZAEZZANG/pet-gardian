@@ -1,131 +1,184 @@
-def _parse_one_frame(frame: bytes):
+"""
+thermal.py
+- MLX90640 열화상 카메라 전용 모듈
+- 배경 온도 대비 '핫 픽셀' 개수를 세고, 그 크기로
+  none / pet / human_or_large 를 분류하는 기능 담당
+
+필요 라이브러리(라즈베리파이에서 한 번만 설치):
+    pip3 install adafruit-circuitpython-mlx90640
+"""
+
+import time
+
+try:
+    import board
+    import busio
+    import adafruit_mlx90640
+    THERMAL_AVAILABLE = True
+except ImportError:
+    # PC에서 개발할 때 ImportError 나도 죽지 않게 처리
+    THERMAL_AVAILABLE = False
+    board = None
+    busio = None
+    adafruit_mlx90640 = None
+
+# ==========================
+# CONFIG (나중에 실험하면서 튜닝)
+# ==========================
+
+# 온도 기준
+HOT_ABS_TEMP = 28.0          # 이 온도 이상이면 "따뜻한 물체" 후보
+HOT_DELTA_TEMP = 4.0         # 배경보다 +4°C 이상이면 핫 픽셀로 취급
+
+# 픽셀 수 기준 (대략값, 실제로 강아지/사람 찍어서 조정 필수!)
+PET_PIXEL_MIN = 15           # 이 이상이면 "작은 동물(소형견/고양이)" 후보
+PET_PIXEL_MAX = 250          # 이 이하까지만 반려동물로 봄
+HUMAN_PIXEL_MIN = 300        # 이 이상이면 사람/큰 물체로 판단
+
+# ==========================
+# 내부 상태
+# ==========================
+
+mlx = None          # 센서 객체
+mlx_frame = [0.0] * 768   # 24x32 프레임 버퍼 (1D 배열)
+
+
+# ==========================
+# 초기화 함수
+# ==========================
+
+def init_thermal():
     """
-    MR60BHA1 프로토콜 기준 단일 프레임 파싱
-    frame 형식:
-      0: 0x53 'S'
-      1: 0x59 'Y'
-      2: control
-      3: command
-      4-5: length (big-endian)
-      6.. : data (len 바이트)
-      마지막-3: checksum
-      마지막-2, -1: 0x54 0x43 ('T','C')
+    MLX90640 초기화.
+    - 성공: True 리턴
+    - 실패 또는 PC 환경 등: False 리턴
     """
-    if len(frame) < 9:
-        return None
+    global mlx
 
-    ctrl = frame[2]
-    cmd = frame[3]
-    data_len = (frame[4] << 8) | frame[5]
-    data_start = 6
-    data_end = data_start + data_len
-    if data_end + 3 > len(frame):
-        return None
+    if not THERMAL_AVAILABLE:
+        print("[THERMAL] adafruit_mlx90640 라이브러리를 찾을 수 없습니다. (PC 환경일 수 있음)")
+        return False
 
-    data = frame[data_start:data_end]
-    checksum = frame[data_end]
-    tail = frame[data_end + 1 : data_end + 3]
-
-    if tail != b"\x54\x43":   # 'T','C'
-        return None
-
-    # (선택사항) 체크섬 확인: 모든 바이트 합의 하위 8비트 == checksum
-    calc = sum(frame[0:data_end]) & 0xFF
-    if calc != checksum:
-        # print(f"[MMW] checksum mismatch: got {checksum:02X}, calc {calc:02X}")
-        return None
-
-    # ctrl/command 조합에 따라 의미 파싱
-    # 0x81 0x02 : 호흡 값 (breath value)
-    # 0x80 0x03 : 몸 움직임 강도 (body movement parameter)
-    result = {}
-
-    if ctrl == 0x81 and cmd == 0x02 and data_len >= 1:
-        # breath value: 0~30 정도, 여기서는 bpm 느낌으로 사용
-        breath_val = data[0]
-        result["bpm"] = float(breath_val)
-
-    if ctrl == 0x80 and cmd == 0x03 and data_len >= 1:
-        motion_val = data[0]  # 0~100 정도
-        result["motion"] = float(motion_val)
-
-    return result or None
-
-
-def get_mmwave_readings():
-    """
-    실제 MR60BHA1 UART 데이터에서
-    - bpm (호흡수/심박수 느낌 값)
-    - motion (움직임 강도)
-    를 추출해서 반환.
-
-    반환 형식:
-      {"bpm": float, "motion": float}
-    값이 아직 없으면 0.0 으로 대체.
-    """
-    global _mmw_ser, _mmw_buf, _mmw_last_bpm, _mmw_last_motion
-
-    # UART 미초기화 시 한 번만 초기화
-    if _mmw_ser is None:
-        init_mmwave_uart()
+    if mlx is not None:
+        # 이미 초기화 된 경우
+        return True
 
     try:
-        chunk = _mmw_ser.read(128)
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
+        sensor = adafruit_mlx90640.MLX90640(i2c)
+        sensor.refresh_rate = adafruit_mlx90640.RefreshRate.REFRESH_4_HZ
+        mlx = sensor
+        print("[THERMAL] MLX90640 초기화 완료.")
+        return True
     except Exception as e:
-        print(f"[MMW] read error: {e}")
-        return {
-            "bpm": _mmw_last_bpm if _mmw_last_bpm is not None else 0.0,
-            "motion": _mmw_last_motion,
-        }
+        print(f"[THERMAL] 초기화 실패: {e}")
+        return False
 
-    if chunk:
-        _mmw_buf += chunk
 
-        # 버퍼에서 여러 프레임을 연속 파싱
-        while True:
-            start = _mmw_buf.find(b"\x53\x59")  # 'S','Y'
-            if start < 0:
-                # 헤더 못 찾으면 버퍼 초기화
-                _mmw_buf = b""
-                break
+# ==========================
+# 메인 측정 함수
+# ==========================
 
-            # 최소 길이(헤더+ctrl+cmd+len+chk+tail) 9바이트
-            if len(_mmw_buf) - start < 9:
-                # 더 읽어야 함
-                if start > 0:
-                    _mmw_buf = _mmw_buf[start:]
-                break
+def get_thermal_readings():
+    """
+    MLX90640 한 프레임 읽어서:
+      1) 전체 픽셀에서 배경 온도(중앙값) 추정
+      2) 배경 + HOT_DELTA_TEMP 이상 & HOT_ABS_TEMP 이상인 픽셀을 '핫 픽셀'로 카운트
+      3) 핫 픽셀들의 평균 온도를 hot_region_temp로 리턴
 
-            # length 읽어서 전체 프레임 길이 계산
-            if start + 6 > len(_mmw_buf):
-                # len 필드까지 아직 안 들어옴
-                break
-            data_len = (_mmw_buf[start+4] << 8) | _mmw_buf[start+5]
-            frame_len = 2 + 1 + 1 + 2 + data_len + 1 + 2  # SY + ctrl + cmd + len + data + chk + TC
+    Returns:
+        (hot_region_temp: float, hot_pixel_count: int)
 
-            if len(_mmw_buf) - start < frame_len:
-                # 프레임 전체가 아직 안 들어옴
-                if start > 0:
-                    _mmw_buf = _mmw_buf[start:]
-                break
+    ※ main 코드에서는 예를 들어:
+        temp, pixels = get_thermal_readings()
+        entity = classify_thermal_entity(pixels)
+    이런 식으로 사용하면 됨.
+    """
+    global mlx, mlx_frame
 
-            frame = _mmw_buf[start:start+frame_len]
-            _mmw_buf = _mmw_buf[start+frame_len:]  # 파싱한 프레임 제거
+    if mlx is None:
+        # 아직 초기화 안 된 경우
+        return 0.0, 0
 
-            parsed = _parse_one_frame(frame)
-            if parsed:
-                if "bpm" in parsed:
-                    _mmw_last_bpm = parsed["bpm"]
-                    # print(f"[MMW] breath={_mmw_last_bpm}")
-                if "motion" in parsed:
-                    _mmw_last_motion = parsed["motion"]
-                    # print(f"[MMW] motion={_mmw_last_motion}")
+    try:
+        mlx.getFrame(mlx_frame)
+    except Exception as e:
+        print(f"[THERMAL] MLX read error: {e}")
+        return 0.0, 0
 
-    # 값이 아직 None이면 기본값 0.0
-    bpm = _mmw_last_bpm if _mmw_last_bpm is not None else 0.0
-    motion = _mmw_last_motion
+    temps = list(mlx_frame)
 
-    return {
-        "bpm": bpm,
-        "motion": motion,
-    }
+    # 1) 배경 온도 추정: 중앙값(median) 사용
+    temps_sorted = sorted(temps)
+    mid = len(temps_sorted) // 2
+    if len(temps_sorted) % 2 == 0:
+        background_temp = (temps_sorted[mid - 1] + temps_sorted[mid]) / 2.0
+    else:
+        background_temp = temps_sorted[mid]
+
+    max_temp = max(temps)
+
+    # 2) 핫 픽셀 기준 온도
+    #    - 절대 기준(HOT_ABS_TEMP)
+    #    - 배경 + DELTA 기준
+    #    둘 중 더 높은 값을 사용
+    threshold = max(HOT_ABS_TEMP, background_temp + HOT_DELTA_TEMP)
+
+    # 3) threshold 이상인 픽셀만 hot 픽셀로 카운트
+    hot_pixels = [t for t in temps if t >= threshold]
+    hot_pixel_count = len(hot_pixels)
+
+    if hot_pixels:
+        hot_region_temp = sum(hot_pixels) / len(hot_pixels)
+    else:
+        hot_region_temp = max_temp  # 핫 픽셀이 없으면 그냥 전체 최대 온도 기준
+
+    return hot_region_temp, hot_pixel_count
+
+
+# ==========================
+# 반려동물/사람 분류 함수
+# ==========================
+
+def classify_thermal_entity(hot_pixel_count: int) -> str:
+    """
+    핫 픽셀 개수로 대략적인 대상 분류:
+
+    Returns:
+        "none"           : 따뜻한 물체 거의 없음
+        "pet"            : 반려동물(소형견/고양이) 정도 크기
+        "human_or_large" : 사람/큰 물체 수준
+        "unknown"        : 애매한 영역 (튜닝 필요)
+
+    ※ 실제로는 mmWave에서 거리/호흡/크기 정보까지 합쳐서
+       최종 판단하는 게 좋고, thermal 쪽은 '크기 힌트' 역할.
+    """
+    if hot_pixel_count < PET_PIXEL_MIN:
+        return "none"
+    elif PET_PIXEL_MIN <= hot_pixel_count <= PET_PIXEL_MAX:
+        return "pet"
+    elif hot_pixel_count >= HUMAN_PIXEL_MIN:
+        return "human_or_large"
+    else:
+        return "unknown"
+
+
+# ==========================
+# 단독 테스트용 (라즈베리파이에서만)
+# ==========================
+
+if __name__ == "__main__":
+    print("=== THERMAL MODULE STANDALONE TEST ===")
+    ok = init_thermal()
+    if not ok:
+        print("열화상 센서 초기화 실패. 라즈베리파이 + MLX90640 환경인지 확인하세요.")
+    else:
+        try:
+            while True:
+                temp, pixels = get_thermal_readings()
+                entity = classify_thermal_entity(pixels)
+                print(f"Temp={temp:.1f}°C, hot_pixels={pixels}, entity={entity}")
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n테스트 종료.")
+
