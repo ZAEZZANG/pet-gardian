@@ -263,3 +263,58 @@ def evaluate_sensor(bpm, temperature):
     CRITICAL_SENT = False
     WARNING_SENT = False
     return "NORMAL"
+
+import requests
+import json
+
+BOT_TOKEN = "8149636240:AAGf4IQIQjrlr4i_RqBAFeKezAWKAxhtxeI"
+CHAT_ID = "8074812404"
+
+def send_alert(bpm, temp, severity):
+    """
+    severity: 'normal', 'warning', 'danger'
+    """
+
+    status_icons = {
+        "normal": "🟢 정상",
+        "warning": "⚠ 경고",
+        "danger": "🚨 긴급"
+    }
+
+    # 텍스트 메시지
+    text = f"""
+🐶 **반려동물 상태 감지됨**
+
+상태: {status_icons.get(severity, "❓ Unknown")}
+
+📌 호흡수: {bpm} BPM
+📌 체온: {temp}°C
+
+👉 확인이 필요합니다.
+"""
+
+    # 버튼 UI 구성
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "📝 기록 보기", "callback_data": "SHOW_LOG"},
+                {"text": "👀 상태 확인", "callback_data": "ACKNOWLEDGE"},
+                {"text": "⛔ 알림 무시", "callback_data": "IGNORE"}
+            ]
+        ]
+    }
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "reply_markup": json.dumps(keyboard),
+        "parse_mode": "Markdown"
+    }
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    try:
+        r = requests.post(url, data=payload)
+        print("[TELEGRAM] ✔ 알림 전송됨")
+    except Exception as e:
+        print("[TELEGRAM] ❌ 전송 실패:", e)
