@@ -80,6 +80,7 @@ def read_sensors():
     }
     return data
 
+git status
 
 # ===================================
 # 🔵 5. 이상 상태 판정 함수 (경고/위험)
